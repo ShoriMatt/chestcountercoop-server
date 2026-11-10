@@ -41,14 +41,18 @@ function snapshot(code) {
         last: p.last,
         matches: p.matches.length,
         live: live ? live.chests : 0,
+        best: p.best || 0,
+        avg: p.matches.length ? Math.round((p.total / p.matches.length) * 10) / 10 : 0,
       };
     })
     .sort((a, b) => b.total - a.total);
+  const top = players.reduce((m, p) => (p.best > (m ? m.best : 0) ? p : m), null);
   return {
     type: 'state',
     room: code,
     total: players.reduce((s, p) => s + p.total, 0),
     treasures: players.reduce((s, p) => s + p.treasures, 0),
+    record: top ? { player: top.name, chests: top.best } : null,
     players,
   };
 }
@@ -56,6 +60,11 @@ function snapshot(code) {
 const sockets = new Map(); // code -> Set<ws>
 function broadcast(code) {
   const msg = JSON.stringify(snapshot(code));
+  for (const ws of sockets.get(code) || []) if (ws.readyState === 1) ws.send(msg);
+}
+
+function broadcastEvent(code, event) {
+  const msg = JSON.stringify({ type: 'event', ...event });
   for (const ws of sockets.get(code) || []) if (ws.readyState === 1) ws.send(msg);
 }
 
@@ -72,6 +81,7 @@ function addMatch(code, player, matchId, chests, treasures) {
   p.total += chests;
   p.treasures += treasures;
   p.last = chests;
+  if (chests > (p.best || 0)) p.best = chests;
   r.updated = Date.now();
   return true;
 }
@@ -125,13 +135,21 @@ wss.on('connection', (ws) => {
     if (role !== 'player') return;
 
     if (m.type === 'match' && validMatch(m)) {
-      if (addMatch(room, player, m.matchId, m.chests, m.treasures || 0)) { scheduleSave(); }
+      const prev = rooms[room].players[player];
+      const seen = prev && prev.live && prev.live.matchId === m.matchId ? prev.live.treasures : 0; // deja annonces en direct
+      const fresh = (m.treasures || 0) - seen;
+      if (addMatch(room, player, m.matchId, m.chests, m.treasures || 0)) {
+        scheduleSave();
+        if (fresh > 0) broadcastEvent(room, { kind: 'treasure', player, count: fresh, at: Date.now() });
+      }
       broadcast(room); // renvoie aussi l'etat a l'expediteur (accuse de reception)
     } else if (m.type === 'live' && validMatch(m)) {
       const r = rooms[room];
       let p = r.players[player];
       if (!p && Object.keys(r.players).length < MAX_PLAYERS) p = r.players[player] = { total: 0, treasures: 0, last: 0, matches: [] };
       if (p && !p.matches.includes(m.matchId)) {
+        const before = p.live && p.live.matchId === m.matchId ? p.live.treasures : 0;
+        if ((m.treasures || 0) > before) broadcastEvent(room, { kind: 'treasure', player, count: (m.treasures || 0) - before, at: Date.now() });
         p.live = { matchId: m.matchId, chests: m.chests, treasures: m.treasures || 0, at: Date.now() };
         r.updated = Date.now();
         broadcast(room); // pas de sauvegarde disque : le direct est ephemere
